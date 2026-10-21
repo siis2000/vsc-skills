@@ -5,31 +5,91 @@ on:
     - cron: '0 0 */5 * *'
   workflow_dispatch:
 
+# The built-in GITHUB_TOKEN belongs to a GitHub App and can never create or
+# update files under .github/workflows/ ("refusing to allow a GitHub App to
+# create or update workflow ... without workflows permission"), and no
+# permissions: key can grant that. Upstream rewrites its workflows from time to
+# time, so this job pushes with a token that carries the workflow scope:
+# a classic PAT with "workflow", or a fine-grained PAT with
+# Workflows: Read and write. Store it as the repository secret SYNC_TOKEN.
 permissions:
   contents: write
+
+concurrency:
+  group: sync-fork
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: vibeshotclub/vsc-skills
+  SYNC_BRANCH: main
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout fork
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
+          ref: main
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: true
+          token: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Configure git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Sync from upstream (vibeshotclub/vsc-skills)
+      - name: Merge upstream into fork
+        id: merge
+        env:
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
         run: |
-          git remote add upstream https://github.com/vibeshotclub/vsc-skills.git
-          git fetch upstream
-          git merge --no-edit upstream/main || {
-            echo "::warning::Merge conflict, retry favoring upstream changes"
-            git merge --abort
-            git merge -X theirs --no-edit upstream/main
-          }
-          git push origin main
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null \
+            || git remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "+refs/heads/${SYNC_BRANCH}:refs/remotes/upstream/${SYNC_BRANCH}"
+          target="upstream/${SYNC_BRANCH}"
+          before="$(git rev-parse HEAD)"
+
+          if git merge-base --is-ancestor "$target" HEAD; then
+            echo "Fork already contains $target; nothing to do."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if git merge-base --is-ancestor HEAD "$target"; then
+            echo "Fast-forwarding to $target."
+            git merge --ff-only "$target"
+          else
+            echo "Branches diverged; merging upstream into the fork."
+            if ! git merge --no-edit "$target"; then
+              echo "::warning::Merge conflict; retrying with conflicts resolved toward upstream."
+              git merge --abort || true
+              git merge -X theirs --no-edit "$target"
+            fi
+          fi
+
+          touched_workflows="$(git diff --name-only "$before" HEAD -- .github/workflows || true)"
+          if [ -n "$touched_workflows" ] && [ -z "${SYNC_TOKEN:-}" ]; then
+            echo "::error::Upstream changed files under .github/workflows/, but SYNC_TOKEN is not set, and GITHUB_TOKEN cannot push those files."
+            echo "::error::Add a PAT with workflow scope as the SYNC_TOKEN repository secret, then re-run this workflow."
+            echo "$touched_workflows"
+            exit 1
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Push synced branch
+        if: steps.merge.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if git push origin "HEAD:refs/heads/${SYNC_BRANCH}"; then
+              echo "Pushed to origin/${SYNC_BRANCH}."
+              exit 0
+            fi
+            echo "::warning::Push attempt ${attempt} failed; retrying."
+            sleep $((attempt * 5))
+          done
+          echo "::error::Could not push the synced branch after 3 attempts."
+          exit 1
